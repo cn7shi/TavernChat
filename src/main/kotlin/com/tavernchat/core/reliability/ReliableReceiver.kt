@@ -4,32 +4,28 @@ import com.tavernchat.core.channel.MessageChannel
 import com.tavernchat.core.channel.MessageListener
 import com.tavernchat.core.model.Message
 import com.tavernchat.core.model.MessageType
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 可靠消息接收器 (完全体)
  * 整合了 ACK 自动回复、LRU 动态去重、小顶堆乱序重组功能。
- *
- * @param userId 接收器所属的用户 ID (如 "Bob")
- * @param channel 底层的物理通信通道
- * @param deduplicator 幂等去重器 (默认使用 ReliabilityConfig 容量)
- * @param reorderer 乱序重组队列 (默认使用 ReliabilityConfig 容量)
- * @param onTextReceived 当真正收到有序文本消息时的业务回调 (交付界面)
+ * 支持按发送者 (sender) 隔离独立维护有序序列流。
  */
 class ReliableReceiver(
     val userId: String,
     private val channel: MessageChannel,
     private val deduplicator: Deduplicator = Deduplicator(),
-    private val reorderer: SequenceReorderer = SequenceReorderer(),
     private val onTextReceived: (Message) -> Unit
 ) : MessageListener {
 
+    // 🚀 核心修复：按 sender 隔离维护各自的重组队列，防止跨发送者序列号错乱
+    private val reordererMap = ConcurrentHashMap<String, SequenceReorderer>()
+
     init {
-        // 构造时自动挂载门铃到通道上
         channel.registerListener(userId, this)
     }
 
     override fun onMessageReceived(message: Message) {
-        // 安全防火墙：非发给我的消息直接忽略
         if (message.receiver != userId) return
 
         when (message.type) {
@@ -37,22 +33,26 @@ class ReliableReceiver(
                 // 1. 幂等去重检查
                 if (deduplicator.isDuplicate(message.id)) {
                     println("[$userId 接收端] ⚠️ 检测到重复消息 (ID: ${message.id})，忽略渲染，但补发 ACK！")
-                    // 核心细节：依然补发 ACK，防止发送端因为丢失 ACK 而盲目无限重发
                     sendAck(toUser = message.sender, ackMessageId = message.id)
                     return
                 }
 
                 println("[$userId 接收端] 收到原始消息: \"${message.content}\" (Seq: ${message.seqId}, ID: ${message.id})")
 
-                // 2. 自动回复 ACK 确认包
+                // 2. 自动回复 ACK
                 sendAck(toUser = message.sender, ackMessageId = message.id)
 
-                // 3. 乱序重组处理
-                val orderedMessages = reorderer.processMessage(message)
+                // 3. 动态获取/创建该发送者专属的重组队列
+                val senderReorderer = reordererMap.computeIfAbsent(message.sender) {
+                    SequenceReorderer()
+                }
 
-                // 4. 将排序重组好的连续消息按顺序交付给界面展示
+                // 4. 按发送者隔离乱序重组
+                val orderedMessages = senderReorderer.processMessage(message)
+
+                // 5. 按顺序交付界面展示
                 orderedMessages.forEach { orderedMsg ->
-                    println("[$userId 接收端] 🎉 顺序开闸交付界面展示: \"${orderedMsg.content}\" (Seq: ${orderedMsg.seqId})")
+                    println("[$userId 接收端] 🎉 [来自于 ${message.sender}] 顺序开闸交付界面展示: \"${orderedMsg.content}\" (Seq: ${orderedMsg.seqId})")
                     onTextReceived(orderedMsg)
                 }
             }
@@ -62,9 +62,6 @@ class ReliableReceiver(
         }
     }
 
-    /**
-     * 发送 ACK 确认包
-     */
     private fun sendAck(toUser: String, ackMessageId: String) {
         val ackMessage = Message(
             sender = userId,

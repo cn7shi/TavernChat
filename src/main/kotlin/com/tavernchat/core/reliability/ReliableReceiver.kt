@@ -6,37 +6,55 @@ import com.tavernchat.core.model.Message
 import com.tavernchat.core.model.MessageType
 
 /**
- * 可靠消息接收器
- * 负责监听通道消息，并在收到普通文本消息时，自动回复 ACK 确认包给发送方。
+ * 可靠消息接收器 (完全体)
+ * 整合了 ACK 自动回复、LRU 动态去重、小顶堆乱序重组功能。
  *
  * @param userId 接收器所属的用户 ID (如 "Bob")
- * @param channel 底层的物理通信通道，用于发送 ACK 回执
- * @param onTextReceived 当真正收到普通文本消息时的业务回调（比如交给 UI 渲染）
+ * @param channel 底层的物理通信通道
+ * @param deduplicator 幂等去重器 (默认使用 ReliabilityConfig 容量)
+ * @param reorderer 乱序重组队列 (默认使用 ReliabilityConfig 容量)
+ * @param onTextReceived 当真正收到有序文本消息时的业务回调 (交付界面)
  */
 class ReliableReceiver(
     val userId: String,
     private val channel: MessageChannel,
+    private val deduplicator: Deduplicator = Deduplicator(),
+    private val reorderer: SequenceReorderer = SequenceReorderer(),
     private val onTextReceived: (Message) -> Unit
 ) : MessageListener {
 
     init {
-        // 挂载门铃：让通道把发给 userId 的消息路由给本接收器
+        // 构造时自动挂载门铃到通道上
         channel.registerListener(userId, this)
     }
 
     override fun onMessageReceived(message: Message) {
-        // 安全防火墙：如果收到的消息不是发给我的，直接忽略
+        // 安全防火墙：非发给我的消息直接忽略
         if (message.receiver != userId) return
 
         when (message.type) {
             MessageType.TEXT -> {
-                println("[$userId 接收端] 收到来自 ${message.sender} 的文本消息: \"${message.content}\" (ID: ${message.id})")
-                
-                // 1. 回调业务层，让聊天界面显示消息
-                onTextReceived(message)
+                // 1. 幂等去重检查
+                if (deduplicator.isDuplicate(message.id)) {
+                    println("[$userId 接收端] ⚠️ 检测到重复消息 (ID: ${message.id})，忽略渲染，但补发 ACK！")
+                    // 核心细节：依然补发 ACK，防止发送端因为丢失 ACK 而盲目无限重发
+                    sendAck(toUser = message.sender, ackMessageId = message.id)
+                    return
+                }
 
-                // 2. 核心 ACK 机制：立刻向发送者回复一个 ACK 确认数据包
+                println("[$userId 接收端] 收到原始消息: \"${message.content}\" (Seq: ${message.seqId}, ID: ${message.id})")
+
+                // 2. 自动回复 ACK 确认包
                 sendAck(toUser = message.sender, ackMessageId = message.id)
+
+                // 3. 乱序重组处理
+                val orderedMessages = reorderer.processMessage(message)
+
+                // 4. 将排序重组好的连续消息按顺序交付给界面展示
+                orderedMessages.forEach { orderedMsg ->
+                    println("[$userId 接收端] 🎉 顺序开闸交付界面展示: \"${orderedMsg.content}\" (Seq: ${orderedMsg.seqId})")
+                    onTextReceived(orderedMsg)
+                }
             }
             MessageType.ACK -> {
                 println("[$userId 接收端] 收到 ACK 消息，本接收端忽略。")
